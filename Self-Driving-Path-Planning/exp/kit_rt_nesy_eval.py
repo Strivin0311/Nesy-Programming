@@ -1,0 +1,805 @@
+import os
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+from scipy.interpolate import make_interp_spline
+
+from src.config import setup_cfg
+from src.model import build_model_rt, build_model_resnet, build_model_traj_resnet
+from src.dataset import KittiDataset, NuscenesDataset, build_dataset_kitti, build_dataset_nuscenes
+from src.astar import GridAStarPlanner, AStarPlanner
+
+
+def eval_grid(model, dataset="kitti", device="cuda:0"):
+    model.eval()
+    """evaluate the model that outputs the obstalce matrix and then generate the trajectory matrix using A*"""
+    planner = GridAStarPlanner()
+    # planner = AStarPlanner()
+    if dataset == "kitti":
+        test_dataloader = build_dataset_kitti(cfg, is_train=False)
+    elif dataset == "nuscenes":
+        test_dataloader = build_dataset_nuscenes(cfg, is_train=False)
+    else:
+        test_dataloader = None
+
+    def gen_pred_traj(output, grids, trajs, threshold=0.5, check_show=False, ):
+        num_batch = output.shape[0]
+        pred = torch.zeros_like(output).to(device)  # shape = (batch_size, 10, 10)
+        solved_idxs = []
+
+        output[output >= threshold] = 1.
+        output[output < threshold] = 0.
+
+        for i in range(num_batch):
+            p, grid_mat, grid, traj = pred[i], output[i], grids[i], trajs[i]
+            # to assign the start point and target point on the predicted trajectory map
+            xmin, ymin, xmax, ymax = int(np.min(grid['bx'])), int(np.min(grid['by'])), \
+                int(np.max(grid['bx'])), int(np.max(grid['by']))
+            width, height = xmax - xmin, ymax - ymin
+            sx_idx, sy_idx = max(0, min(round(grid['sx'] - xmin), width - 1)), max(0, min(height - 1 - round(
+                grid['sy'] - ymin), height - 1))
+            tx_idx, ty_idx = max(0, min(round(grid['tx'] - xmin), width - 1)), max(0, min(height - 1 - round(
+                grid['ty'] - ymin), height - 1))
+
+            if isinstance(planner, GridAStarPlanner):  # get gt traj mat using GridAstarPlanner
+                gt_path = planner.planning(grid['mat'], sx_idx, sy_idx, tx_idx, ty_idx)
+                traj_mat = np.zeros_like(np.array(traj['mat']))
+                for x, y in gt_path:
+                    traj_mat[y, x] = 1.
+                traj['mat'] = traj_mat.tolist()
+            if check_show:
+                plt.imshow(np.array(grid['mat']))
+                plt.savefig(f"{i}_gt_grid.png")
+                plt.imshow(np.array(traj['mat']))
+                plt.savefig(f"{i}_gt_traj.png")
+                plt.imshow(grid_mat.cpu().numpy())
+                plt.savefig(f"{i}_pred_grid.png")
+                plt.close()
+
+            if isinstance(planner, GridAStarPlanner):
+                path = planner.planning(grid_mat, sx_idx, sy_idx, tx_idx, ty_idx)
+            elif isinstance(planner, AStarPlanner):
+                pr_obstales = grid_mat.nonzero().cpu().numpy()
+                # pathx, pathy, _, _ = planner.planning(
+                #     sx_idx, sy_idx, tx_idx, ty_idx,
+                #     ox=list(map(lambda x: min(int(x) + xmin, xmax - 1), pr_obstales[:, 1])) +
+                #        list(map(lambda x: max(0, min(round(x - xmin), width - 1)), grid['bx'])),
+                #     oy=list(map(lambda y: min((height - 1 - int(y)) + ymin, ymax - 1), pr_obstales[:, 0])) +
+                #        list(map(lambda y: max(0, min(height - 1 - round(y - ymin), height - 1)), grid['by'])),
+                #     resolution=1.0, rr=0.00001,
+                # )
+
+                # test ground truth
+                oxs = [x for ox in grid['ox'] for x in ox] + grid['bx']
+                oys = [y for oy in grid['oy'] for y in oy] + grid['by']
+                pathx, pathy, _, _ = planner.planning(
+                    sx_idx, sy_idx, tx_idx, ty_idx,
+                    ox=list(map(lambda x: min(int(x) + xmin, xmax - 1), pr_obstales[:, 1])) +
+                       list(map(lambda x: max(0, min(round(x - xmin), width - 1)), grid['bx'])),
+                    oy=list(map(lambda y: min((height - 1 - int(y)) + ymin, ymax - 1), pr_obstales[:, 0])) +
+                       list(map(lambda y: max(0, min(height - 1 - round(y - ymin), height - 1)), grid['by'])),
+                    resolution=1.0, rr=0.00001,
+                )
+                if len(pathx) == 1:
+                    path = None
+                else:
+                    path = [(int(pathx[i]), int(pathy[i])) for i in range(len(pathx))]
+            else:
+                path = None
+            if path is not None:
+                for x, y in path:
+                    p[y, x] = 1.
+                solved_idxs.append(i)
+            if check_show:
+                plt.imshow(p.cpu().numpy())
+                plt.savefig(f"{i}_pred_traj.png")
+                plt.close()
+
+        return pred, solved_idxs
+
+    def get_acc(pred, target, solved_idxs):
+        """get the precision and recall for the pred(generated by logits) with the target"""
+        if len(solved_idxs) == 0:
+            return 0, 0, 0
+
+        tp = torch.logical_and(pred[solved_idxs] == target[solved_idxs], target[solved_idxs] > 0).sum().item()
+        t, p = (target[solved_idxs] > 0).sum().item(), (pred[solved_idxs] > 0).sum().item()
+
+        pre = tp / p if p > 0 else 0  # get precision
+        rec = tp / t if t > 0 else 0  # get recall
+
+        return tp, p, t
+
+    def check_collide_length(pred, target, solved_idxs):
+        """check if the predicted trajectory(generated by logits) will collide on the grid with obstacles(presented by target)"""
+        total_cnt = target[solved_idxs].shape[0]
+        collided_cnt = 0
+        diff_len_cnt = 0
+
+        for i in range(total_cnt):
+            p, t = pred[solved_idxs][i], target[solved_idxs][i]  # p/t.shape = (10,10)
+            # check if the smoothed predicted trajectory collided on the target grid
+            collided = torch.any(p[t == 1] == 1)
+            if collided:
+                collided_cnt += 1
+            else:
+                diff_len_cnt += torch.abs(p.sum() - t.sum()).item()
+
+        return collided_cnt, diff_len_cnt, total_cnt
+
+    pbar = tqdm(enumerate(test_dataloader), total=len(test_dataloader))
+    sol_tps, sol_ps, sol_ts = 0, 0, 0
+    col_cnts, dl_cnts, tot_cnts = 0, 0, 0
+    no_solved_cnts, cnts = 0, 0
+    threshold = 0.5
+    check_show = False
+
+    for i, batch in pbar:
+        ## load data
+        x, img_infos = batch['images'].to(device), batch["img_infos"]
+        grids, trajs = batch['grids'], batch['trajs']
+
+        with torch.no_grad():
+            output = model(x)  # shape = (batch_size, 10, 10), range = [0,1]
+            pred, solved_idxs = gen_pred_traj(output, grids, trajs, threshold=threshold, check_show=check_show)
+            cnts += output.shape[0]
+            no_solved_cnts += (output.shape[0] - len(solved_idxs))
+
+            # solving part: 0-1 matrix where 1 represents the trajectory point and it's given
+            sol_y = torch.stack([torch.Tensor(traj['mat']).long().to(device) for traj in
+                                 trajs])  # shape = (batch_size, 10, 10)
+            # perception part: 0-1 matrix where 1 represents the obstacle point while it's not given for symbol grounding
+            per_y = torch.stack([torch.Tensor(grid['mat']).long().to(device) for grid in
+                                 grids])  # shape = (batch_size, 10, 10)
+
+            # get solving acc
+            sol_tp, sol_p, sol_t = get_acc(pred, sol_y, solved_idxs)
+            sol_tps += sol_tp
+            sol_ps += sol_p
+            sol_ts += sol_t
+            # check if collided
+            col_cnt, dl_cnt, tot_cnt = check_collide_length(pred, per_y, solved_idxs)
+            col_cnts += col_cnt
+            dl_cnts += dl_cnt
+            tot_cnts += tot_cnt
+
+        pbar.set_description(
+            f"Iter {i}: precision: {sol_tps / sol_ps if sol_ps > 0 else 0.:.4f} | " +
+            f"recall: {sol_tps / sol_ts if sol_ts > 0 else 0.:.4f}] | " +
+            f"collide rate: {col_cnts / tot_cnts if tot_cnts > 0 else 0.:.4f} | " +
+            f"length diff: {dl_cnts / (tot_cnts - col_cnts) if tot_cnts > col_cnts else 0:.4f} | " +
+            f"no solved number: {no_solved_cnts} over sample number: {cnts}"
+        )
+
+
+def eval_traj(model, dataset="kitti", device="cuda:0"):
+    model.eval()
+    """evaluate the model that directly outputs the trajectory matrix"""
+
+    def gen_pred(logits, target, grids, gt_trajs, check_show=False, ):
+        """generate the smoothed predicted trajectory 01 matrix"""
+        logit = logits[:, 0, :, :].squeeze(dim=1)  # shape = (batch_size, 10, 10, 2)
+        pred = logit.argmax(dim=-1)  # shape = (batch_size, 10, 10)
+        num_batch = target.shape[0]
+        sample_ratio = 100
+        smooth_method = ["interpolate", "Astar"][1]
+
+        for i in range(num_batch):
+            p, t, grid = pred[i], target[i], grids[i]  # p/t.shape = (10,10), grid is a dict
+            if check_show:
+                plt.imshow(p.cpu().numpy())
+                plt.savefig(f"{i}_original.png")
+                plt.close()
+                plt.imshow(gt_trajs[i].cpu().numpy())
+                plt.savefig(f"{i}_gt_traj.png")
+                plt.close()
+                plt.imshow(t.cpu().numpy())
+                plt.savefig(f"{i}_gt_grid.png")
+                plt.close()
+            # to assign the start point and target point on the predicted trajectory map
+            xmin, ymin, xmax, ymax = int(np.min(grid['bx'])), int(np.min(grid['by'])), \
+                int(np.max(grid['bx'])), int(np.max(grid['by']))
+            width, height = xmax - xmin, ymax - ymin
+            sx_idx, sy_idx = max(0, min(round(grid['sx'] - xmin), width - 1)), max(0, min(height - 1 - round(
+                grid['sy'] - ymin), height - 1))
+            tx_idx, ty_idx = max(0, min(round(grid['tx'] - xmin), width - 1)), max(0, min(height - 1 - round(
+                grid['ty'] - ymin), height - 1))
+            p[sy_idx, sx_idx] = 1
+            p[ty_idx, tx_idx] = 1
+            if check_show:
+                plt.imshow(p.cpu().numpy())
+                plt.savefig(f"{i}_addst.png")
+                plt.close()
+            # to smooth the predicted trajectory
+            if smooth_method == "interpolate":  # by interpolation
+                w = p.nonzero().cpu().numpy()
+                wx, wy = w[:, 1], w[:, 0]
+                param = np.linspace(0, 1, wy.size)  # parameterized  input
+                f = make_interp_spline(param, np.c_[wy, wx], k=2)  # function
+                cxs, cys = f(np.linspace(0, 1, wy.size * sample_ratio)).T  # output
+                cxs_idx, cys_idx = cxs.round().astype(np.int32), cys.round().astype(np.int32)
+                for cx_idx, cy_idx in zip(cxs_idx, cys_idx):
+                    p[cx_idx, cy_idx] = 1
+            elif smooth_method == "Astar":  # by Astar
+                find_consecutive_path(p, (sy_idx, sx_idx))
+            if check_show:
+                plt.imshow(p.cpu().numpy())
+                plt.savefig(f"{i}_smoothed.png")
+                plt.close()
+
+        return pred
+
+    def get_acc(pred, target):
+        """get the precision and recall for the pred(generated by logits) with the target"""
+        tp = torch.logical_and(pred == target, target > 0).sum().item()
+        t, p = (target > 0).sum().item(), (pred > 0).sum().item()
+
+        pre = tp / p if p > 0 else 0  # get precision
+        rec = tp / t if t > 0 else 0  # get recall
+        acc = (pred == target).reshape(pred.size(0), -1).all(dim=1).float().sum()
+
+        return tp, p, t, acc
+
+    def check_collide_length(pred, target):
+        """check if the predicted trajectory(generated by logits) will collide on the grid with obstacles(presented by target)"""
+        total_cnt = target.shape[0]
+        collided_cnt = 0
+        diff_len_cnt = 0
+
+        for i in range(total_cnt):
+            p, t = pred[i], target[i]  # p/t.shape = (10,10)
+            # check if the smoothed predicted trajectory collided on the target grid
+            collided = torch.any(p[t == 1] == 1)
+            if collided:
+                collided_cnt += 1
+            else:
+                diff_len_cnt += torch.abs(p.sum() - t.sum()).item()
+
+        return collided_cnt, diff_len_cnt, total_cnt
+
+    def find_consecutive_path(matrix, start):
+        import queue
+        def is_valid(x, y, matrix):
+            return 0 <= x < len(matrix) and 0 <= y < len(matrix[0])
+
+        def bfs(matrix, ones, start):
+            rows, cols = len(matrix), len(matrix[0])
+            directions = [(0, 1), (0, -1), (1, 0), (-1, 0), (-1, -1), (-1, 1), (1, -1), (1, 1)]
+            visited = [[False for _ in range(cols)] for _ in range(rows)]
+            visited[start[0]][start[1]] = True
+            q = queue.Queue()
+            q.put(start)
+            parent = {start: (-1, -1)}
+
+            while not q.empty():
+                (x, y) = q.get()
+
+                for dx, dy in directions:
+                    nx, ny = x + dx, y + dy
+                    if is_valid(nx, ny, matrix) and not visited[nx][ny]:
+                        if (nx, ny) in ones:
+                            parent[(nx, ny)] = (x, y)
+                            return (nx, ny), parent
+                        # if matrix[nx][ny] == 1:
+                        #     continue
+                        visited[nx][ny] = True
+                        parent[(nx, ny)] = (x, y)
+                        q.put((nx, ny))
+
+            return -1, -1
+
+        ones = set([(i, j) for i in range(len(matrix)) for j in range(len(matrix[0])) if matrix[i][j] == 1])
+
+        while len(ones) != 0:
+            ones.remove(start)
+            end, parent = bfs(matrix, ones, start)
+            if parent != -1:
+                p = end
+                while p != (-1, -1):
+                    matrix[p[0]][p[1]] = 1
+                    p = parent[p]
+            start = end
+
+    def get_point_mat(grids):
+        # boundary and dimensions
+        xmin, ymin, xmax, ymax = int(np.min(grids[0]['bx'])), int(np.min(grids[0]['by'])), \
+            int(np.max(grids[0]['bx'])), int(np.max(grids[0]['by']))
+        width, height = xmax - xmin, ymax - ymin
+
+        sp = torch.zeros((len(grids), 10, 10)).to(device)
+        tp = torch.zeros((len(grids), 10, 10)).to(device)
+
+        for i, grid in enumerate(grids):
+            sx_idx, sy_idx = max(0, min(round(grid['sx'] - xmin), width - 1)), max(0, min(height - 1 - round(
+                grid['sy'] - ymin), height - 1))
+            tx_idx, ty_idx = max(0, min(round(grid['tx'] - xmin), width - 1)), max(0, min(height - 1 - round(
+                grid['ty'] - ymin), height - 1))
+            sp[i, sy_idx, sx_idx] = 1.
+            tp[i, ty_idx, tx_idx] = 1.
+
+        return sp, tp
+
+    if dataset == "kitti":
+        test_dataloader = build_dataset_kitti(cfg, is_train=False)
+    elif dataset == "nuscenes":
+        test_dataloader = build_dataset_nuscenes(cfg, is_train=False)
+    else:
+        test_dataloader = None
+
+    pbar = tqdm(enumerate(test_dataloader), total=len(test_dataloader))
+    accs, cnts = 0, 0
+    sol_tps, sol_ps, sol_ts = 0, 0, 0
+    col_cnts, dl_cnts, tot_cnts = 0, 0, 0
+
+    for i, batch in pbar:
+        ## load data
+        x, img_infos = batch['images'].to(device), batch["img_infos"]
+        grids, trajs = batch['grids'], batch['trajs']
+
+        # solving part: 0-1 matrix where 1 represents the trajectory point and it's given
+        sol_y = torch.stack([torch.Tensor(traj['mat']).long().to(device) for traj in
+                             trajs])  # shape = (batch_size, 10, 10)
+        # perception part: 0-1 matrix where 1 represents the obstacle point while it's not given for symbol grounding
+        per_y = torch.stack([torch.Tensor(grid['mat']).long().to(device) for grid in
+                             grids])  # shape = (batch_size, 10, 10)
+
+        sp, tp = get_point_mat(grids)
+
+        with torch.no_grad():
+            logits, _, _ = model(x, sp=sp, tp=tp)
+            pred = gen_pred(logits, per_y, grids, sol_y)  # shape = (batch_size, 10, 10)
+            # get solving acc
+            sol_tp, sol_p, sol_t, acc = get_acc(pred, sol_y)
+            sol_tps += sol_tp
+            sol_ps += sol_p
+            sol_ts += sol_t
+            accs += acc
+            cnts += x.shape[0]
+            # check if collided
+            col_cnt, dl_cnt, tot_cnt = check_collide_length(pred, per_y)
+            col_cnts += col_cnt
+            dl_cnts += dl_cnt
+            tot_cnts += tot_cnt
+
+        pbar.set_description(
+            f"Iter {i}: precision: {sol_tps / sol_ps if sol_ps > 0 else 0.:.4f} | " +
+            f"recall: {sol_tps / sol_ts if sol_ts > 0 else 0.:.4f}] | " +
+            f"collide rate: {col_cnts / tot_cnts if tot_cnts > 0 else 0.:.4f} | " +
+            f"length diff: {dl_cnts / (tot_cnts - col_cnts) if tot_cnts > col_cnts else 0:.4f} | " +
+            f"acc: {accs / cnts:.4f}"
+        )
+
+
+def show_grid(model, dataset="kitti", device="cuda:0"):
+    model.eval()
+    planner = GridAStarPlanner()
+
+    def show(idx, output, gt_grid, gt_traj, threshold=0.5):
+        """preds shape = (1, 10, 10) is the predicted obstacle matrix, and needs threshold to become 0-1 matrix"""
+
+        def plot(grid, pr_grid, trajs, figsize=(12, 6), times=1, sample_ratio=100, save_path=None):
+            """
+            draw several trajs on the grid, but currently trajs only contain at most two trajs
+            one is ground-truth traj, the other is predicted traj
+            """
+
+            fig = plt.figure(figsize=figsize)
+            ax1 = fig.add_subplot(121)
+            ax2 = fig.add_subplot(122)
+
+            #############   draw ax1    #############
+
+            ## draw grid
+            bx, by, oxs, oys, sx, sy, tx, ty = (
+                np.array(grid['bx']) * times, np.array(grid['by']) * times,
+                np.array(grid['ox']) * times, np.array(grid['oy']) * times,
+                np.array(grid['sx']) * times, np.array(grid['sy']) * times,
+                np.array(grid['tx']) * times, np.array(grid['ty']) * times,
+            )
+
+            # black boundary as cross
+            ax1.scatter(bx, by, marker='+', s=20, c='k')
+            # other colors as X
+            for ox, oy in zip(oxs, oys):
+                ax1.scatter(ox, oy, marker='x', s=20)
+            # blue start point shaped as triangle
+            ax1.scatter(sx, sy, c='slategray', marker='^', s=70)
+            # red goal point shaped as star
+            ax1.scatter(tx, ty, c='tomato', marker='*', s=70)
+
+            ## draw trajactory
+            labels = ['ground-truth', 'predicted']
+            clist = ['darkorange', 'steelblue']  # now only support 2 trajs
+            handler = []
+            for i, traj in enumerate(trajs):
+                px, py = np.array(traj['pathx']) * times, np.array(traj['pathy']) * times
+                if len(px) == 1:  # no path
+                    continue
+                while py[0] > ty:  # get rid of the waypoints that overhead the target point
+                    px, py = px[1:], py[1:]
+                px, py = px[:-1], py[:-1]
+                # create an interpolation function f
+                # wx, wy = np.array(px), np.array(py)
+                wx, wy = np.append(np.append(px, sx)[::-1], tx), np.append(np.append(py, sy)[::-1], ty)  # waypoints
+                param = np.linspace(0, 1, wy.size)  # parameterized  input
+                f = make_interp_spline(param, np.c_[wy, wx], k=2)  # function
+                cx, cy = f(np.linspace(0, 1, wy.size * sample_ratio)).T  # output
+                # draw waypoints
+                h = ax1.scatter(px, py, alpha=0.6, c=clist[i % len(clist)], label=labels[i % len(labels)])
+                # draw connecting plots
+                ax1.plot(cy, cx, '-', alpha=0.7, c=clist[i % len(clist)], label=labels[i % len(labels)])
+                handler.append(h)
+            ax1.set_aspect(1)
+
+            #############   draw ax2    #############
+            ## draw grid
+            bx, by, oxs, oys, sx, sy, tx, ty = (
+                np.array(pr_grid['bx']) * times, np.array(pr_grid['by']) * times,
+                np.array(pr_grid['ox']) * times, np.array(pr_grid['oy']) * times,
+                np.array(pr_grid['sx']) * times, np.array(pr_grid['sy']) * times,
+                np.array(pr_grid['tx']) * times, np.array(pr_grid['ty']) * times,
+            )
+
+            # black boundary as cross
+            ax2.scatter(bx, by, marker='+', s=20, c='k')
+            # other colors as X
+            for ox, oy in zip(oxs, oys):
+                ax2.scatter(ox, oy, marker='x', s=70)
+            # blue start point shaped as triangle
+            ax2.scatter(sx, sy, c='slategray', marker='^', s=70)
+            # red goal point shaped as star
+            ax2.scatter(tx, ty, c='tomato', marker='*', s=70)
+
+            ## draw trajactory
+            labels = ['ground-truth', 'predicted']
+            clist = ['darkorange', 'steelblue']  # now only support 2 trajs
+            for i, traj in enumerate(trajs):
+                if i == 0:  # the predicted one does not need gt traj
+                    continue
+                px, py = np.array(traj['pathx']) * times, np.array(traj['pathy']) * times
+                if len(px) == 1:  # no path
+                    continue
+                while py[0] > ty:  # get rid of the waypoints that overhead the target point
+                    px, py = px[1:], py[1:]
+                px, py = px[:-1], py[:-1]
+                # create an interpolation function f
+                # wx, wy = np.array(px), np.array(py)
+                wx, wy = np.append(np.append(px, sx)[::-1], tx), np.append(np.append(py, sy)[::-1], ty)  # waypoints
+                param = np.linspace(0, 1, wy.size)  # parameterized  input
+                f = make_interp_spline(param, np.c_[wy, wx], k=2)  # function
+                cx, cy = f(np.linspace(0, 1, wy.size * sample_ratio)).T  # output
+                # draw waypoints
+                ax2.scatter(px, py, alpha=0.6, c=clist[i % len(clist)])
+                # draw connecting plots
+                ax2.plot(cy, cx, '-', alpha=0.7, c=clist[i % len(clist)])
+            ax2.set_aspect(1)
+
+            #############   draw legend and save    #############
+
+            # draw legend
+            plt.figlegend(handles=handler,
+                          loc=(0.80, 0.79))  # loc = (delta_x, delta_y) is the distance from the bottom left point
+            # plt.legend(loc=(0.64, 0.83))
+            if save_path:
+                plt.savefig(save_path, dpi=100, bbox_inches='tight', )
+            plt.close()
+
+        def gen_pred_traj(output, grids, threshold=0.5, check_show=False, ):
+            num_batch = output.shape[0]
+            pred = torch.zeros_like(output).to(device)  # shape = (batch_size, 10, 10)
+            solved_idxs = []
+
+            output[output >= threshold] = 1.
+            output[output < threshold] = 0.
+
+            for i in range(num_batch):
+                p, grid_mat, grid = pred[i], output[i], grids[i]
+                if check_show:
+                    plt.imshow(grid_mat.cpu().numpy())
+                    plt.savefig(f"{i}_grid_mat.png")
+                    plt.close()
+                # to assign the start point and target point on the predicted trajectory map
+                xmin, ymin, xmax, ymax = int(np.min(grid['bx'])), int(np.min(grid['by'])), \
+                    int(np.max(grid['bx'])), int(np.max(grid['by']))
+                width, height = xmax - xmin, ymax - ymin
+                sx_idx, sy_idx = max(0, min(round(grid['sx'] - xmin), width - 1)), max(0, min(height - 1 - round(
+                    grid['sy'] - ymin), height - 1))
+                tx_idx, ty_idx = max(0, min(round(grid['tx'] - xmin), width - 1)), max(0, min(height - 1 - round(
+                    grid['ty'] - ymin), height - 1))
+                path = planner.planning(grid_mat, sx_idx, sy_idx, tx_idx, ty_idx)
+                if path is not None:
+                    for x, y in path:
+                        p[y, x] = 1.
+                    solved_idxs.append(i)
+                if check_show:
+                    plt.imshow(p.cpu().numpy())
+                    plt.savefig(f"{i}_pred.png")
+                    plt.close()
+
+                # print(path)
+
+            return pred, output, solved_idxs
+
+        pr_traj_mat, pr_grid_mat, solved_idxs = gen_pred_traj(output, [gt_grid],
+                                                              threshold=threshold)  # shape=(1, 10, 10)
+        pr_traj_mat, pr_grid_mat = pr_traj_mat[0], pr_grid_mat[0]
+        xmin, ymin, xmax, ymax = int(np.min(gt_grid['bx'])), int(np.min(gt_grid['by'])), \
+            int(np.max(gt_grid['bx'])), int(np.max(gt_grid['by']))
+        width, height = xmax - xmin, ymax - ymin
+        pr_traj_path = pr_traj_mat.nonzero().cpu().numpy()
+        pathx, pathy = list(map(lambda x: min(x + xmin, xmax - 1), pr_traj_path[:, 1])), \
+            list(map(lambda y: min((height - 1 - y) + ymin, ymax - 1), pr_traj_path[:, 0]))
+        pr_traj = {
+            "pathx": pathx, "pathy": pathy,
+            "mat": pr_traj_mat.cpu().numpy().tolist()
+        }
+        pr_obstales = pr_grid_mat.nonzero().cpu().numpy()
+        pr_grid = {
+            "sx": gt_grid['sx'], "sy": gt_grid['sy'], "tx": gt_grid['tx'], "ty": gt_grid['ty'],
+            "bx": gt_grid['bx'], "by": gt_grid['by'],
+            "ox": list(map(lambda x: min(int(x) + xmin, xmax - 1), pr_obstales[:, 1])),
+            "oy": list(map(lambda y: min((height - 1 - int(y)) + ymin, ymax - 1), pr_obstales[:, 0]))
+        }
+        trajs = [gt_traj, pr_traj]
+        plot(gt_grid, pr_grid, trajs, save_path="plot2_{}.png".format(idx))
+
+    if dataset == "kitti":
+        test_dataset = KittiDataset(cfg, split='test', is_train=False)
+    elif dataset == "nuscenes":
+        test_dataset = NuscenesDataset(cfg, split='test', is_train=False)
+    else:
+        test_dataset = None
+
+    threshold = 0.5
+
+    for idx in tqdm(range(len(test_dataset))):
+        data = test_dataset[idx]
+        x, gt_grid, gt_traj = data[0].unsqueeze(0).to(device), data[3], data[4]
+        output = model(x)  # shape = (1,10,10)
+        show(idx, output, gt_grid, gt_traj, threshold=threshold)
+
+
+def show_traj(model, dataset="kitti", device="cuda:0"):
+    model.eval()
+    """show the predicted trajectory and the ground-truth trajectory on the ground-truth grid
+    for the model that directly outputs the trajectory matrix"""
+
+    def show(idx, preds, gt_grid, gt_traj):
+        """preds shape = (1,2,10,10,2), and the first (10,10,2) is 0-1 trajectory matrix"""
+
+        def plot(grid, trajs, figsize=(6, 6), times=1, sample_ratio=100, save_path=None):
+            """
+            draw several trajs on the grid, but currently trajs only contain at most two trajs
+            one is ground-truth traj, the other is predicted traj
+            """
+
+            fig = plt.figure(figsize=figsize)
+            ax1 = fig.add_subplot(111)
+
+            ## draw grid
+            bx, by, oxs, oys, sx, sy, tx, ty = (
+                np.array(grid['bx']) * times, np.array(grid['by']) * times,
+                np.array(grid['ox']) * times, np.array(grid['oy']) * times,
+                np.array(grid['sx']) * times, np.array(grid['sy']) * times,
+                np.array(grid['tx']) * times, np.array(grid['ty']) * times,
+            )
+
+            # black boundary as cross
+            ax1.scatter(bx, by, marker='+', s=20, c='k')
+            # other colors as X
+            for ox, oy in zip(oxs, oys):
+                ax1.scatter(ox, oy, marker='x', s=20)
+            # blue start point shaped as triangle
+            ax1.scatter(sx, sy, c='slategray', marker='^', s=70)
+            # red goal point shaped as star
+            ax1.scatter(tx, ty, c='tomato', marker='*', s=70)
+
+            ## draw trajactory
+            labels = ['ground-truth', 'predicted']
+            clist = ['darkorange', 'steelblue']  # now only support 2 trajs
+            for i, traj in enumerate(trajs):
+                px, py = np.array(traj['pathx']) * times, np.array(traj['pathy']) * times
+                if len(px) == 1:  # no path
+                    continue
+                while py[0] > ty:  # get rid of the waypoints that overhead the target point
+                    px, py = px[1:], py[1:]
+                px, py = px[:-1], py[:-1]
+                # create an interpolation function f
+                # wx, wy = np.array(px), np.array(py)
+                wx, wy = np.append(np.append(px, sx)[::-1], tx), np.append(np.append(py, sy)[::-1], ty)  # waypoints
+                param = np.linspace(0, 1, wy.size)  # parameterized  input
+                f = make_interp_spline(param, np.c_[wy, wx], k=2)  # function
+                cx, cy = f(np.linspace(0, 1, wy.size * sample_ratio)).T  # output
+
+                # draw waypoints
+                ax1.scatter(px, py, alpha=0.6, c=clist[i % len(clist)])
+                # draw connecting plots
+                ax1.plot(cy, cx, '-', alpha=0.7, c=clist[i % len(clist)], label=labels[i % len(labels)])
+            ax1.set_aspect(1)
+
+            # draw legend
+            plt.legend(loc=(0.64, 0.83))
+            plt.axis("off")
+            if save_path:
+                plt.savefig(save_path, dpi=100, bbox_inches='tight', )
+            plt.close()
+
+        def gen_pred(logits, target, grids, gt_trajs, check_show=False, ):
+            """generate the smoothed predicted trajectory 01 matrix"""
+            logit = logits[:, 0, :, :].squeeze(dim=1)  # shape = (batch_size, 10, 10, 2)
+            pred = logit.argmax(dim=-1)  # shape = (batch_size, 10, 10)
+            num_batch = target.shape[0]
+            sample_ratio = 100
+            smooth_method = ["interpolate", "Astar"][1]
+
+            for i in range(num_batch):
+                p, t, grid = pred[i], target[i], grids[i]  # p/t.shape = (10,10), grid is a dict
+                if check_show:
+                    plt.imshow(p.cpu().numpy())
+                    plt.savefig(f"{i}_original.png")
+                    plt.close()
+                    plt.imshow(gt_trajs[i].cpu().numpy())
+                    plt.savefig(f"{i}_gt_traj.png")
+                    plt.close()
+                    plt.imshow(t.cpu().numpy())
+                    plt.savefig(f"{i}_gt_grid.png")
+                    plt.close()
+                # to assign the start point and target point on the predicted trajectory map
+                xmin, ymin, xmax, ymax = int(np.min(grid['bx'])), int(np.min(grid['by'])), \
+                    int(np.max(grid['bx'])), int(np.max(grid['by']))
+                width, height = xmax - xmin, ymax - ymin
+                sx_idx, sy_idx = max(0, min(round(grid['sx'] - xmin), width - 1)), max(0, min(height - 1 - round(
+                    grid['sy'] - ymin), height - 1))
+                tx_idx, ty_idx = max(0, min(round(grid['tx'] - xmin), width - 1)), max(0, min(height - 1 - round(
+                    grid['ty'] - ymin), height - 1))
+                p[sy_idx, sx_idx] = 1
+                p[ty_idx, tx_idx] = 1
+                if check_show:
+                    plt.imshow(p.cpu().numpy())
+                    plt.savefig(f"{i}_addst.png")
+                    plt.close()
+                # to smooth the predicted trajectory
+                if smooth_method == "interpolate":  # by interpolation
+                    w = p.nonzero().cpu().numpy()
+                    wx, wy = w[:, 1], w[:, 0]
+                    param = np.linspace(0, 1, wy.size)  # parameterized  input
+                    f = make_interp_spline(param, np.c_[wy, wx], k=2)  # function
+                    cxs, cys = f(np.linspace(0, 1, wy.size * sample_ratio)).T  # output
+                    cxs_idx, cys_idx = cxs.round().astype(np.int32), cys.round().astype(np.int32)
+                    for cx_idx, cy_idx in zip(cxs_idx, cys_idx):
+                        p[cx_idx, cy_idx] = 1
+                elif smooth_method == "Astar":  # by Astar
+                    find_consecutive_path(p, (sy_idx, sx_idx))
+                if check_show:
+                    plt.imshow(p.cpu().numpy())
+                    plt.savefig(f"{i}_smoothed.png")
+                    plt.close()
+
+            return pred
+
+        def find_consecutive_path(matrix, start):
+            import queue
+            def is_valid(x, y, matrix):
+                return 0 <= x < len(matrix) and 0 <= y < len(matrix[0])
+
+            def bfs(matrix, ones, start):
+                rows, cols = len(matrix), len(matrix[0])
+                directions = [(0, 1), (0, -1), (1, 0), (-1, 0), (-1, -1), (-1, 1), (1, -1), (1, 1)]
+                visited = [[False for _ in range(cols)] for _ in range(rows)]
+                visited[start[0]][start[1]] = True
+                q = queue.Queue()
+                q.put(start)
+                parent = {start: (-1, -1)}
+
+                while not q.empty():
+                    (x, y) = q.get()
+
+                    for dx, dy in directions:
+                        nx, ny = x + dx, y + dy
+                        if is_valid(nx, ny, matrix) and not visited[nx][ny]:
+                            if (nx, ny) in ones:
+                                parent[(nx, ny)] = (x, y)
+                                return (nx, ny), parent
+                            # if matrix[nx][ny] == 1:
+                            #     continue
+                            visited[nx][ny] = True
+                            parent[(nx, ny)] = (x, y)
+                            q.put((nx, ny))
+
+                return -1, -1
+
+            ones = set([(i, j) for i in range(len(matrix)) for j in range(len(matrix[0])) if matrix[i][j] == 1])
+
+            while len(ones) != 0:
+                ones.remove(start)
+                end, parent = bfs(matrix, ones, start)
+                if parent != -1:
+                    p = end
+                    while p != (-1, -1):
+                        matrix[p[0]][p[1]] = 1
+                        p = parent[p]
+                start = end
+
+
+        pr_traj_mat = \
+        gen_pred(preds, torch.Tensor(gt_grid['mat']).unsqueeze(0).long().to(device), [gt_grid], [gt_traj])[
+            0]  # shape=(10,10)
+
+        xmin, ymin, xmax, ymax = int(np.min(gt_grid['bx'])), int(np.min(gt_grid['by'])), \
+            int(np.max(gt_grid['bx'])), int(np.max(gt_grid['by']))
+        width, height = xmax - xmin, ymax - ymin
+        pr_traj_path = pr_traj_mat.nonzero().cpu().numpy()
+        pathx, pathy = list(map(lambda x: min(x + xmin, xmax - 1), pr_traj_path[:, 1])), \
+            list(map(lambda y: min((height - 1 - y) + ymin, ymax - 1), pr_traj_path[:, 0]))
+        pr_traj = {
+            "pathx": pathx, "pathy": pathy,
+            "mat": pr_traj_mat.cpu().numpy().tolist()
+        }
+        trajs = [gt_traj, pr_traj]
+        if idx == 13:
+            plot(gt_grid, [], save_path="./figs/paper_figs/sup-r18-kit-figs/plot_{}-sup-r18.png".format(idx))
+        else:
+            plot(gt_grid, trajs, save_path="./figs/paper_figs/sup-r18-kit-figs/plot_{}-sup-r18.png".format(idx))
+
+    if dataset == "kitti":
+        test_dataset = KittiDataset(cfg, split='test', is_train=False)
+        training_dataset = KittiDataset(cfg, split='train', is_train=True)
+    elif dataset == "nuscenes":
+        test_dataset = NuscenesDataset(cfg, split='test', is_train=False)
+        training_dataset = NuscenesDataset(cfg, split='train', is_train=True)
+    else:
+        test_dataset = None
+        training_dataset = None
+
+    print(len(training_dataset))
+    print(len(test_dataset))
+
+    for idx in tqdm(range(len(test_dataset))):
+        data = test_dataset[idx]
+        info = data[1]
+        x, gt_grid, gt_traj = data[0].unsqueeze(0).to(device), data[3], data[4]
+        preds, _, _ = model(x)  # shape=(1, 2, 10, 10, 2)
+        show(idx, preds, gt_grid, gt_traj)
+        if idx == 13:
+            print(info)
+
+
+if __name__ == "__main__":
+    ######      simple evaluation   #######
+    cfg = setup_cfg()
+    device = "cuda:0"
+    dataset = ["kitti", "nuscenes"][0]
+    model_flag = 0
+    mode = ["sup", "nesy", "resnet10", "sup"]
+    ckpt_paths = [
+        "./logs/{}_rt_{}_model_st_e99.pth".format(dataset[:3], mode[model_flag]),
+        "./logs/{}_rt_{}_model_st_e99.pth".format(dataset[:3], mode[model_flag]),
+        "./logs/{}_{}_model_e99.pth".format(dataset[:3], mode[model_flag]),
+        "./logs/{}_r18_{}_model_st_e99.pth".format(dataset[:3], mode[model_flag])
+    ]
+
+    print(
+        f"Evaluate the model in a {mode[model_flag]} way with checkpoint {ckpt_paths[model_flag]} on the dataset {dataset}")
+
+    ## load the model
+    if model_flag == 0:  # evaluate the model that directly outputs the trajectory matrix, which trained under a supervised mode
+        model = build_model_rt(cfg, device)
+        model.load_state_dict(torch.load(ckpt_paths[model_flag], map_location=device))
+    elif model_flag == 1:  # evaluate the model that directly outputs the trajectory matrix, which trained under a neuro-symbolic mode
+        model = build_model_rt(cfg, device)
+        model.load_state_dict(torch.load(ckpt_paths[model_flag], map_location=device))
+    elif model_flag == 2:  # evaluate the model that outputs the obstacle matrix, and gives the trajectory using A* planner
+        model = build_model_resnet(cfg, device)
+        model.load_state_dict(torch.load(ckpt_paths[model_flag], map_location=device))
+    else:  # the same model i/o as flag 0 but with Resnet structure instead
+        model = build_model_traj_resnet(cfg, device)
+        model.load_state_dict(torch.load(ckpt_paths[model_flag], map_location=device))
+
+    ## evaluate
+    if model_flag == 2:  # the model that outputs the obstacle matrix first
+        eval_grid(model, dataset, device)
+        # show_grid(model, dataset, device)
+    else:  # the model that directly outputs the trajectory matrix
+        # eval_traj(model, dataset, device)
+        show_traj(model, dataset, device)
