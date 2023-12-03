@@ -1,0 +1,6 @@
+torch>=1.0.0
+tqdm
+requests
+py-sudoku
+matplotlib
+scipy
